@@ -4,9 +4,9 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
 use rand::{distributions::Standard, Rng};
 
-const NUM_PAYLOADS: usize = 1000;
+const NUM_PAYLOADS: usize = 100000;
 const PAYLOAD_SIZE: usize = 512; // Updated to 512 bytes
-const RPS: u64 = 500;
+const RPS: u64 = 100;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
