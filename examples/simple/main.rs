@@ -190,7 +190,7 @@ fn run_node(proposals: Receiver<Prop>,
             network_send: Sender<Vec<Message>>,
             mut node: RawNode<MemStorage>) {
     let mut t = Instant::now();
-    let timeout = Duration::from_millis(10);
+    let timeout = Duration::from_micros(50);
     let mut response_hashmap: HashMap<u64, oneshot::Sender<Option<()>>> = HashMap::default();
 
     loop {
