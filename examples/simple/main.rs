@@ -1,5 +1,5 @@
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SendError, TryRecvError};
+use std::time::{Duration, Instant};
 use std::{str, thread};
 use std::collections::HashMap;
 use std::env;
@@ -17,7 +17,8 @@ use std::io::{self};
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 
-const NODE_LIST: [&'static str; 3] = ["127.0.0.1:9000","127.0.0.1:9001", "127.0.0.1:9002"];
+// const NODE_LIST: [&'static str; 3] = ["127.0.0.1:9000","127.0.0.1:9001", "127.0.0.1:9002"];
+const NODE_LIST: [&'static str; 3] = ["172.31.35.207:9000","172.31.24.122:9000", "172.31.2.67:9000"];
 
 enum Prop {
     Data(Vec<u8>,oneshot::Sender<Option<()>>,),
@@ -26,12 +27,6 @@ enum Prop {
 
 use std::net::UdpSocket;
 use std::io::{ErrorKind};
-
-fn raft_send(addr: &str, data: &[u8]) -> io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?; // Bind to a random port
-    socket.send_to(data, addr)?;
-    Ok(())
-}
 
 fn raft_listen(addr: &str, sender: Sender<Message>) -> io::Result<()> {
     let socket = UdpSocket::bind(addr)?;
@@ -52,17 +47,27 @@ fn raft_listen(addr: &str, sender: Sender<Message>) -> io::Result<()> {
     }
 }
 
-fn send_messages(msgs: Vec<Message>) {
-    for msg in msgs {
-        let node_id = msg.to;
-        let addr = get_addr(node_id as usize);
-        match msg.write_to_bytes() {
-            Ok(data) => {
-                if let Err(e) = raft_send(addr, &data) {
-                    eprintln!("Failed to send message to {}: {}", addr, e);
+fn send_messages_thread(msg_receiver: Receiver<Vec<Message>>) {
+    let timeout = Duration::from_millis(10);
+    let socket = UdpSocket::bind("0.0.0.0:0").expect("couldn't bind");
+    loop {
+        match msg_receiver.recv_timeout(timeout) {
+            Ok(msgs) => {
+                for msg in msgs {
+                    let node_id = msg.to;
+                    let addr = get_addr(node_id as usize);
+                    match msg.write_to_bytes() {
+                        Ok(data) => {
+                            if let Err(e) = socket.send_to(&data, addr) {
+                                eprintln!("Failed to send message to {}: {}", addr, e);
+                            }
+                        },
+                        Err(e) => eprintln!("Failed to serialize message: {}", e),
+                    }
                 }
-            },
-            Err(e) => eprintln!("Failed to serialize message: {}", e),
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
 }
@@ -74,7 +79,7 @@ fn get_addr(id: usize) -> &'static str {
 fn get_config() -> Config {
     Config {
         max_size_per_msg: 1024 * 1024 * 1024,
-        max_inflight_msgs: 512,
+        max_inflight_msgs: 1024,
         applied: 0,
         election_tick: 10,
         heartbeat_tick: 3,
@@ -92,32 +97,32 @@ fn handle_committed_entries(node: &mut RawNode<MemStorage>,
         if entry.data.is_empty() {
             continue;
         }
-        if let Some(sender) = response_map.remove(&last_apply_index) {
-            let _ = sender.send(Some(()));
-        }
-
         if let EntryType::EntryConfChange = entry.get_entry_type() {
             let mut cc = ConfChange::default();
             cc.merge_from_bytes(&entry.data).unwrap();
             let cs = node.apply_conf_change(&cc).unwrap();
             store.wl().set_conf_state(cs);
         } else {
-            println!("{:?}: {:?}",std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),entry.data);
+            // HANDLE NORMAL ENTRY
         }
         if node.raft.state == StateRole::Leader {
-            // CLIENT RESPONSE ONE SHOT
+            if let Some(sender) = response_map.remove(&last_apply_index) {
+                let _ = sender.send(Some(()));
+            }
         }
     }
 }
 
-fn on_ready(node: &mut RawNode<MemStorage>, response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>) {
+fn on_ready(node: &mut RawNode<MemStorage>,
+            network_send: Sender<Vec<Message>>,
+            response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>) {
     if !node.has_ready() {
         return;
     }
     let mut ready = node.ready();
 
     if !ready.messages().is_empty() {
-        send_messages( ready.take_messages());
+        network_send.send( ready.take_messages()).unwrap();
     }
 
     let store = node.raft.raft_log.store.clone();
@@ -137,14 +142,14 @@ fn on_ready(node: &mut RawNode<MemStorage>, response_map: &mut HashMap<u64, ones
     }
 
     if !ready.persisted_messages().is_empty() {
-        send_messages(ready.take_persisted_messages());
+        network_send.send(ready.take_persisted_messages()).unwrap();
     }
 
     let mut light_rd = node.advance(ready);
     if let Some(commit) = light_rd.commit_index() {
         store.wl().mut_hard_state().set_commit(commit);
     }
-    send_messages(light_rd.take_messages());
+    network_send.send(light_rd.take_messages()).unwrap();
     handle_committed_entries(node,  &store, light_rd.take_committed_entries(), response_map);
     node.advance_apply();
 }
@@ -180,7 +185,10 @@ fn initialize_leader(logger: &Logger) -> RawNode<MemStorage> {
     RawNode::new(&cfg, storage, &logger).unwrap()
 }
 
-fn run_node(proposals: Receiver<Prop>, raft_channel: Receiver<Message>, mut node: RawNode<MemStorage>) {
+fn run_node(proposals: Receiver<Prop>,
+            raft_channel: Receiver<Message>,
+            network_send: Sender<Vec<Message>>,
+            mut node: RawNode<MemStorage>) {
     let mut t = Instant::now();
     let timeout = Duration::from_millis(10);
     let mut response_hashmap: HashMap<u64, oneshot::Sender<Option<()>>> = HashMap::default();
@@ -221,7 +229,7 @@ fn run_node(proposals: Receiver<Prop>, raft_channel: Receiver<Message>, mut node
             }
         }
 
-        on_ready(&mut node, &mut response_hashmap);
+        on_ready(&mut node, network_send.clone(), &mut response_hashmap);
     }
 }
 
@@ -252,7 +260,7 @@ fn start_web_server(proposals: Sender<Prop>) {
                 .app_data(proposals.clone())
                 .service(web::resource("/post").route(web::post().to(handle_post_request)))
         })
-            .bind("127.0.0.1:8080")
+            .bind("0.0.0.0:8080")
             .unwrap()
             .run();
 
@@ -277,7 +285,10 @@ fn main() {
 
     let (prop_s, prop_r) = mpsc::channel();
     let (channel_s, channel_r) = mpsc::channel();
+    let (network_send, network_recv) = mpsc::channel();
+    
     let listener = thread::spawn(move || raft_listen(get_addr(node_id as usize), channel_s).unwrap());
+    let sender = thread::spawn(move || send_messages_thread(network_recv));
 
     let node = if node_id==1 {
         initialize_leader(&logger)
@@ -285,29 +296,19 @@ fn main() {
         create_follower(node_id, &logger)
     };
 
-    let m = thread::spawn(move ||
-        run_node(prop_r,channel_r, node)
+    let raft_node_runner = thread::spawn(move ||
+        run_node(prop_r,channel_r, network_send, node)
     );
 
 
     if node_id==1 {
         initialize_all_followers(prop_s.clone());
         thread::sleep(Duration::from_millis(5000));
-        // let mut prop_vec = vec![];
-        // for i in 1..100000u64 {
-        //         prop_vec.push(i.to_le_bytes());
-        // }
-        // for msg in prop_vec {
-        //     // thread::sleep(Duration::from_millis(1));
-        //     prop_s.send(Prop::Data(msg.to_vec())).unwrap();
-        // }
-
         start_web_server(prop_s);
-
     }
 
 
-    m.join().unwrap();
+    raft_node_runner.join().unwrap();
     listener.join().unwrap();
-
+    sender.join().unwrap();
 }
