@@ -14,6 +14,9 @@ use raft::{prelude::*, StateRole};
 use slog::o;
 use slog::{Drain, Level};
 use std::io::{self};
+use std::net::UdpSocket;
+use std::io::{ErrorKind};
+use std::sync::{Arc, Mutex};
 
 use actix_web::{web, App, HttpResponse, HttpServer};
 
@@ -25,8 +28,25 @@ enum Prop {
     Conf(ConfChange)
 }
 
-use std::net::UdpSocket;
-use std::io::{ErrorKind};
+struct StateMachine {
+    data: HashMap<u64, Vec<u8>>,
+}
+
+impl StateMachine {
+    fn new() -> Self {
+        StateMachine {
+            data: HashMap::new(),
+        }
+    }
+
+    fn apply_entry(&mut self, key: u64, value: Vec<u8>) {
+        self.data.insert(key, value);
+    }
+
+    fn query(&self, key: u64) -> Option<&Vec<u8>> {
+        self.data.get(&key)
+    }
+}
 
 fn raft_listen(addr: &str, sender: Sender<Message>) -> io::Result<()> {
     let socket = UdpSocket::bind(addr)?;
@@ -90,7 +110,8 @@ fn get_config() -> Config {
 fn handle_committed_entries(node: &mut RawNode<MemStorage>,
                             store: &MemStorage,
                             committed_entries: Vec<Entry>,
-                            response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>
+                            response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>,
+                            smr: Arc<Mutex<StateMachine>>
 ) {
     for entry in committed_entries {
         let last_apply_index = entry.index;
@@ -103,7 +124,8 @@ fn handle_committed_entries(node: &mut RawNode<MemStorage>,
             let cs = node.apply_conf_change(&cc).unwrap();
             store.wl().set_conf_state(cs);
         } else {
-            // HANDLE NORMAL ENTRY
+            let mut sm = smr.lock().unwrap();
+            sm.apply_entry(last_apply_index, entry.data.to_vec());
         }
         if node.raft.state == StateRole::Leader {
             if let Some(sender) = response_map.remove(&last_apply_index) {
@@ -115,7 +137,8 @@ fn handle_committed_entries(node: &mut RawNode<MemStorage>,
 
 fn on_ready(node: &mut RawNode<MemStorage>,
             network_send: Sender<Vec<Message>>,
-            response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>) {
+            response_map: &mut HashMap<u64, oneshot::Sender<Option<()>>>,
+            smr: Arc<Mutex<StateMachine>>) {
     if !node.has_ready() {
         return;
     }
@@ -130,7 +153,11 @@ fn on_ready(node: &mut RawNode<MemStorage>,
         store.wl().apply_snapshot(ready.snapshot().clone()).unwrap();
     }
 
-    handle_committed_entries(node, &store, ready.take_committed_entries(), response_map);
+    handle_committed_entries(node,
+                             &store,
+                             ready.take_committed_entries(),
+                             response_map,
+                             smr.clone());
 
     if !ready.entries().is_empty() {
         store.wl().append(ready.entries()).unwrap();
@@ -150,7 +177,9 @@ fn on_ready(node: &mut RawNode<MemStorage>,
         store.wl().mut_hard_state().set_commit(commit);
     }
     network_send.send(light_rd.take_messages()).unwrap();
-    handle_committed_entries(node,  &store, light_rd.take_committed_entries(), response_map);
+    handle_committed_entries(node,  &store,
+                             light_rd.take_committed_entries(),
+                             response_map, smr);
     node.advance_apply();
 }
 
@@ -188,7 +217,8 @@ fn initialize_leader(logger: &Logger) -> RawNode<MemStorage> {
 fn run_node(proposals: Receiver<Prop>,
             raft_channel: Receiver<Message>,
             network_send: Sender<Vec<Message>>,
-            mut node: RawNode<MemStorage>) {
+            mut node: RawNode<MemStorage>,
+            smr: Arc<Mutex<StateMachine>>) {
     let mut t = Instant::now();
     let timeout = Duration::from_micros(50);
     let mut response_hashmap: HashMap<u64, oneshot::Sender<Option<()>>> = HashMap::default();
@@ -229,7 +259,18 @@ fn run_node(proposals: Receiver<Prop>,
             }
         }
 
-        on_ready(&mut node, network_send.clone(), &mut response_hashmap);
+        on_ready(&mut node, network_send.clone(), &mut response_hashmap, smr.clone());
+    }
+}
+
+async fn query_smr(key: web::Path<u64>, smr: web::Data<Arc<Mutex<StateMachine>>>) -> impl Responder {
+    let key = key.into_inner();
+    let smr = smr.lock().unwrap();
+
+    if let Some(value) = smr.query(key) {
+        HttpResponse::Ok().json(value)
+    } else {
+        HttpResponse::NotFound().body("Key not found")
     }
 }
 
@@ -249,8 +290,9 @@ async fn handle_post_request(body: web::Bytes, proposals: web::Data<Sender<Prop>
     }
 }
 
-fn start_web_server(proposals: Sender<Prop>) {
+fn start_web_server(proposals: Sender<Prop>, smr: Arc<Mutex<StateMachine>>) {
     let proposals = web::Data::new(proposals);
+    let smr_data = web::Data::new(smr);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -258,7 +300,9 @@ fn start_web_server(proposals: Sender<Prop>) {
         let server = HttpServer::new(move || {
             App::new()
                 .app_data(proposals.clone())
+                .app_data(smr_data.clone())
                 .service(web::resource("/post").route(web::post().to(handle_post_request)))
+                .service(web::resource("/query/{key}").route(web::get().to(query_smr)))
         })
             .bind("0.0.0.0:8080")
             .unwrap()
@@ -269,7 +313,6 @@ fn start_web_server(proposals: Sender<Prop>) {
 }
 
 fn main() {
-
     // Logging
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -290,6 +333,8 @@ fn main() {
     let listener = thread::spawn(move || raft_listen(get_addr(node_id as usize), channel_s).unwrap());
     let sender = thread::spawn(move || send_messages_thread(network_recv));
 
+    let state_machine = Arc::new(Mutex::new(StateMachine::new()));
+    let thread_msr = state_machine.clone();
     let node = if node_id==1 {
         initialize_leader(&logger)
     } else {
@@ -297,16 +342,15 @@ fn main() {
     };
 
     let raft_node_runner = thread::spawn(move ||
-        run_node(prop_r,channel_r, network_send, node)
+        run_node(prop_r,channel_r, network_send, node, thread_msr)
     );
-
 
     if node_id==1 {
         initialize_all_followers(prop_s.clone());
         thread::sleep(Duration::from_millis(5000));
-        start_web_server(prop_s);
     }
 
+    start_web_server(prop_s, state_machine);
 
     raft_node_runner.join().unwrap();
     listener.join().unwrap();
