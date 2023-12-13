@@ -1,4 +1,4 @@
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SendError, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 use std::{str, thread};
 use std::collections::HashMap;

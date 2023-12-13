@@ -41,6 +41,8 @@ tokio = { version = "1", features = ["full"] }
 slog-async = "2.3.0"
 futures = "0.3"
 actix-web = "4.4.0"
+hdrhistogram = "7"
+reqwest = { version = "0.11", features = ["json"] }
 
 [dev-dependencies]
 criterion = "0.3"
